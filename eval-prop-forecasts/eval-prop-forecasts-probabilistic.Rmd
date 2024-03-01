@@ -1,0 +1,200 @@
+---
+title: "Evaluation of probabilistic predictions of population proportions"
+author: "Evan L. Ray"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+In this document, I carry out a simulation study that is similar to the one in `eval-prop-forecasts.ipynb`, but attempts to be more careful to show the setup in a fully probabilistic way.
+
+# Simulation study: setup
+
+## Data generating process
+
+We posit the following data generating process, with $n_A$ being the number of samples for a target date that are reported as of the nowcast creation date, $n_B$ the number of samples for that target date that are later reported, and $n = n_A + n_B$ being the total number of eventually-reported samples for that date:
+
+\begin{align*}
+\Theta &\sim Dirichlet(10 \cdot (0.1, 0.3, 0.6)) \\
+A \mid \theta &\sim Multinomial(\theta, n_A) \\
+B \mid \theta &\sim Multinomial(\theta, n_B) \\
+C \mid A, B = A + B &\sim Multinomial(\theta, n)
+\end{align*}
+
+On each simulation replicate, we draw realizations $\theta$, $a$, and $b$ of these random variables. Under assumptions outlined in the other notebook, $A$ and $B$ are independent, from which the multinomial result for $C$ follows.
+
+(Note that I have switched to the notation $\theta$ rather than $\mu$ to allow for easier distinction between the random variable $\Theta$ and the realizaion $\theta$.)
+
+## Representation of predictive distributions and evaluation
+
+A predictive distribution $\hat{F}_\Theta$ for $\Theta$ will be represented by a collection of samples $\hat{\theta}_i$, $i = 1, \ldots, 1000$ from that distribution.
+
+We will then produce a collection of samples $\hat{c}_i$ where each such sample is drawn from a $Multinomial(\hat{\theta}_i, n)$ distribution.  (Note: here, we will produce a single sample from each such multinomial distribution, but in practice it might be better to do something else to reduce MC variability in the resulting scores.  Reserving that for a future discussion though.) These samples can be regarded as being draws from the marginal predictive distribution for $C$ given $n$.
+
+We will then calculate the energy score, which is a multivariate generalization of CRPS (see section 5 of the `scoringRules` vignette).  The inputs to this score calculation will be the predictive samples for $C$ and the eventually-observed value of $c$: $S_{ES}(c, (\hat{c}_1, \ldots, \hat{c}_{1000}))$.
+
+The above represents our proposed method. However, to make clearer the point that evaluating based on partially reported data is tricky, we will also compute a second score based on $B$, the samples that have not yet been reported as of the date that predictions are created. To do this, we repeat the above but based on samples $\hat{b}_i \sim Multinomial(\hat{\theta}_i, n_B)$. This score computation is $S_{ES}(b, (\hat{b}_1, \ldots, \hat{b}_{1000}))$.
+
+## Modelers
+
+We consider three groups of modelers with different information sets and strategies for using that information. Within each group, a range of specific models are obtained using different interpolating factors $\alpha$ to shift a predictive distribution for $\mu$ toward the preliminary sample proportions $a / n_A$.  A value of $\alpha$ close to 1 will mean that the predictive distribution is shifted to more closely match the preliminary sample proportions, while a value of $\alpha$ close to 0 will mean that no adjustment is made to the predictive distribution to specifically address the nature of partially reported data being used to perform the evaluation.
+
+I included three groups because it's not clear to me which group is the right one to be thinking about, but I wanted to illustrate that the basic result holds for all three groups.  I think Group 2's strategy is probably the most realistic?  I think the results for Group 1 are not the right ones to focus on, but included it for completeness.
+
+### Group 1
+
+Modelers in the first group know the $Dirichlet(10 \cdot (0.1, 0.3, 0.6))$ distribution from which $\theta$ was drawn.  They do not formally update this distribution based on the observation $A = a$, but they do shrink it towards the observed sample proportions $a/n$ by an amount $\alpha$ to address partial reporting. Note that this is not a logical/self-consistent procedure.
+
+To generate predictions, these modelers generate 1000 samples $\tilde{\theta}_i \sim Dirichlet(10 \cdot (0.1, 0.3, 0.6))$, and then compute the shrunken estimates $\hat{\theta}_i = \alpha \cdot (a / n_A) + (1 - \alpha) \cdot \tilde{\theta}_i$. The samples $\hat{\theta}_i$ form their final submission representing their predictive distribution.
+
+### Group 2
+
+Modelers in the second group know the $Dirichlet(10 \cdot (0.1, 0.3, 0.6))$ distribution from which $\theta$ was drawn.  From this knowledge and the observation $A = a$, they compute the exact posterior
+$$\Theta \mid A = a \sim Dirichlet(10 \cdot (0.1, 0.3, 0.6) + a).$$  Then they further shrink this posterior toward the observed sample proportions $a/n$ by an amount $\alpha$ to address partial reporting.
+
+To generate predictions, these modelers generate 1000 samples $\tilde{\theta}_i \sim Dirichlet(10 \cdot (0.1, 0.3, 0.6) + a)$, and then compute the shrunken estimates $\hat{\theta}_i = \alpha \cdot (a / n_A) + (1 - \alpha) \cdot \tilde{\theta}_i$. The samples $\hat{\theta}_i$ form their final submission representing their predictive distribution.
+
+### Group 3
+
+Modelers in the third group have exact knowledge of the value of $\theta$ that was sampled; in other words, their predictive distribution for $\Theta$ is a point mass at $\theta$.  They shrink this distribution toward the observed sample proportions $a/n$ by an amount $\alpha$ to address partial reporting.
+
+To generate predictions, these modelers generate 1000 "samples" $\tilde{\theta}_i$ that are all equal to $\theta$, and then compute the shrunken estimates $\hat{\theta}_i = \alpha \cdot (a / n_A) + (1 - \alpha) \cdot \tilde{\theta}_i$. The samples $\hat{\theta}_i$ form their final submission representing their predictive distribution.
+
+# Simulation study: computations and results
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+
+library(furrr)
+
+library(scoringRules)
+
+library(gtools)
+```
+
+```{r}
+shrink_and_score_one_alpha <- function(theta_tilde, alpha, sample_prop_broadcast, obs) {
+  n <- sum(obs)
+  theta_hat <- alpha * sample_prop_broadcast + (1 - alpha) * theta_tilde
+
+  obs_hat <- purrr::map(
+    seq_len(ncol(theta_tilde)),
+    function(i) {
+      rmultinom(n = 1, size = n, prob = theta_hat[, i])
+    }) |>
+    do.call(what = cbind)
+
+  es_sample(obs[, 1], obs_hat)
+}
+
+
+shrink_and_score <- function(theta_tilde, alpha, n_A, a, b, c) {
+  sample_prop_broadcast <- matrix(
+    rep(a / n_A, ncol(theta_tilde)),
+    nrow = length(a),
+    ncol = ncol(theta_tilde))
+
+  data.frame(
+    alpha = alpha,
+    ES_b = purrr::map_dbl(
+      alpha,
+      function(one_alpha) {
+        shrink_and_score_one_alpha(theta_tilde, one_alpha, sample_prop_broadcast, b)
+      }),
+    ES_c = purrr::map_dbl(
+      alpha,
+      function(one_alpha) {
+        shrink_and_score_one_alpha(theta_tilde, one_alpha, sample_prop_broadcast, c)
+      })
+  )
+}
+
+
+do_one_replicate <- function(replicate_index,
+                             theta_shape = 10 * c(0.1, 0.3, 0.6),
+                             n_A = 40,
+                             n_B = 10,
+                             n_alpha = 33,
+                             n_theta_draws = 1000) {
+  # generate data
+  theta <- rdirichlet(n = 1, alpha = theta_shape)
+  a <- rmultinom(n = 1, size = n_A, prob = theta)
+  b <- rmultinom(n = 1, size = n_B, prob = theta)
+  c <- a + b
+  
+  # shrinkage levels
+  alpha <- seq(from = 0.01, to = 0.99, length.out = n_alpha)
+  
+  # modeler group 1
+  theta_tilde <- t(rdirichlet(n = n_theta_draws, alpha = theta_shape))
+  results_group1 <- shrink_and_score(theta_tilde, alpha, n_A, a, b, c)
+  
+  # modeler group 2
+  theta_tilde <- t(rdirichlet(n = n_theta_draws, alpha = theta_shape + a))
+  results_group2 <- shrink_and_score(theta_tilde, alpha, n_A, a, b, c)
+  
+  # modeler group 3
+  theta_tilde <- matrix(rep(theta, n_theta_draws),
+                        nrow = 3, ncol = n_theta_draws)
+  results_group3 <- shrink_and_score(theta_tilde, alpha, n_A, a, b, c)
+
+  dplyr::bind_rows(
+    results_group1 |> mutate(group = 1, replicate_index = replicate_index),
+    results_group2 |> mutate(group = 2, replicate_index = replicate_index),
+    results_group3 |> mutate(group = 3, replicate_index = replicate_index)
+  )
+}
+```
+
+```{r, cache=TRUE}
+n_replicates <- 1000
+
+plan(multisession, workers = 14)
+
+results <- furrr::future_map(
+  seq_len(n_replicates),
+  do_one_replicate,
+  .progress = TRUE,
+  .options = furrr_options(seed = 42)
+)
+```
+
+```{r}
+summarized_scores <- results |>
+  purrr::list_rbind() |>
+  group_by(alpha, group) |>
+  summarise(
+    mean_ES_b = mean(ES_b),
+    mean_ES_c = mean(ES_c)
+  ) |>
+  pivot_longer(cols = starts_with("mean_ES_"),
+               names_to = "scored_outcome",
+               names_prefix = "mean_ES_",
+               values_to = "mean_ES")
+```
+
+The following plot displays results. The first column (header "b") shows mean scores across all replicates when evaluating based on just the data reported after the prediction creation date, and the second column (header "c") shows mean scores when evaluating based on the full finalized data report, $c$. There is one row for each group of modelers. (I'm using an awkward `facet_wrap` here because I couldn't get `facet_grid` to respect my requests for free y scales...)
+
+```{r}
+ggplot(data = summarized_scores) +
+  geom_line(mapping = aes(x = alpha, y = mean_ES)) +
+  geom_vline(xintercept = 0.8) +
+  facet_wrap(group ~ scored_outcome, scales = "free", ncol = 2)
+
+```
+
+The main observations are:
+
+ - As stated above, I think we should just ignore the results for Group 1.  Some of the shrinkage here is probably just approximating the Bayesian updating that's done by Group 2.
+ - When the predictions are evaluated based on the full data (column c), shrinkage toward the partially reported sample proportions is helpful. The amount of shrinkage to use is about $n_A/n$ when $\theta$ is known (group 3), but it is a little bigger in group 2. I'm not exactly sure why this is, but it might be derivable.
+ - In contrast, when predictions are evaluated based only on the data that came in after the predictions were generated (column b), this shrinkage is not helpful.
+
+I think the fundamental reason for this is that although the marginal distribution of $C \mid \theta, n$ is $Multinomial(\theta, n)$, the conditional distribution of $C \mid A = a$ is different. Therefore, a score that uses our procedure to look at the distribution of $C$ when $A = a$ is available does not reward reporting estimates of $\theta$; it rewards reporting estimates of the parameter to feed into a Multinomial distribution to best approximate the conditional distribution of $C \mid A = a$.
+
+Also, I regret using the word "shrinkage" in all of this discussion.  That word has a technical meaning that is different than what's going on here.
