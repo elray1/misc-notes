@@ -232,7 +232,7 @@ kl_div_by_model <- purrr::map(
 p <- ggplot(data = kl_div_by_model) +
   geom_line(mapping = aes(x = num_bins, y = rank, color = model_id))
 
-ggplotly(p)
+print(p)
 ```
 
 Maybe a reasonable option here is to just choose a fairly large number of bins?  There aren't that many rank switches after 100 bins...
