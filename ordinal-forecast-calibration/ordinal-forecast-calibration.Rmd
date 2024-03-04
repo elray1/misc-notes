@@ -1,0 +1,240 @@
+---
+title: "Measuring calibration of ordinal forecasts"
+author: "Evan L. Ray"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, cache = TRUE)
+```
+
+# Introduction
+
+In this document, I describe a possible approach to quantifying the (probabilistic) calibration of forecasts of an ordinal variable. Our running example is state-level forecasts of the change in rates of influenza hospitalizations per 100k population that are being collected by the FluSight forecast hub in the 2023/24 season. Forecasts assign probabilities to the following categories describing the magnitude and direction of change in influenza: "large decrease", "decrease", "stable", "increase", "large increase".  Noting that these categories are ordered, we assign them the numeric labels 1, 2, 3, 4, and 5.
+
+A predictive pmf from a particular forecaster for a "forecasting task" indexed by $i$ is denoted by $f_i$, and it assigns probabilities to these categories that are non-negative and sum to 1: $f_i(k) \geq 0$, $\sum_{k = 1}^5 f_i(k) = 1$.  For our purposes, a forecasting task corresponds to a combination of location, reference date, and forecast horizon.  For each such task, we will eventually observe the outcome $y_i \in \{1, \ldots, 5\}$, which is the label of the hospitalization rate change class that occurred. For example, $f_i(y_i)$ is the probability the foreaster assigned to the observed category. The predictive pmf $f_i$ can also be converted into a predictive cdf $F_i$ via $F_i(k) = \sum_{j \leq k} f_i(k)$.  $F_i(y_i)$ is then the predicted probability that the rate change category would be less than or equal to the observed category.  We define $F_i(0) = 0$.
+
+The proposed approach to measuring the calibration of these forecasts has two steps:
+
+1. Compute the probability integral transform (PIT) values of the forecasts.
+2. Compute the KL divergence of the distribution of these PIT values from a Uniform(0, 1) distribution.
+
+We'll briefly recap these steps below, but also direct the reader to the following references:
+
+ - Ranjan and Gneiting is a fairly technical paper about a different problem, that happens to have the definition of PIT values that I'll be using (see definition 2.6). https://arxiv.org/abs/1106.1638  There is probably a better reference somewhere, but I couldn't think of what it would be immediately.  Ranjan and Gneiting cite Brockwell, which is about yet another setting where things are multivariate: https://www.sciencedirect.com/science/article/pii/S0167715207000715?casa_token=Zou3lJct3j0AAAAA:CEftAfh9WTu2XaS7cVEpUtXE1uRabbidKg1KBfIzmErEUyszx9LCvtbCvQiAhQh0dLUw1roCSA
+ - Rumack, Tibshirani, and Rosenfeld uses the KL divergence of the empirical distribution of PIT values from a Uniform(0, 1) [equivalently, negative entropy] as a measure of calibration of flu forecasts: https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1010771
+
+# PIT values
+
+For a continuous random variable $Y$ with predictive cdf $F$, the PIT value is $Z = F(Y)$.  In the setup of Ranjan and Gneiting, both $Y$ and $F$ are regarded as being random variables.  When both are "realized", we can compute an "observed PIT value" $z = F(y)$ (where now we have a specific forecast distribution $F$, but we don't have good notation to distinguish it from the random forecast above).
+
+Note that $F(y)$ is the predicted probability that $Y \leq y$, so it falls in the interval $[0, 1]$. The forecast $F$ is probabilistically calibrated if its PIT $Z$ is uniformly distributed on this interval: $Z \sim Unif(0, 1)$.
+
+In a setting where the random variable $Y$ is not continuous, an adjustment to the computation of the PIT value is required in order to retain the result that $Z \sim Unif(0, 1)$ for a probabilistically calibrated forecast. Here is a statement of Def. 2.6. in Ranjan and Gneiting that has been adapted for our (simpler, less general) setting:
+\begin{align*}
+Z &= F(Y - 1) + V \cdot [F(Y) - F(Y - 1)] \text{ where} \\
+V &\sim Unif(0, 1)
+\end{align*}
+In this definition, the PIT score is distributed uniformly at random between the predicted cumulative probability at the observed category and the next-lowest category.
+
+As a concrete example, suppose the forecast has the cumulative probabilities $F(1) = 0.1$, $F(2) = 0.2$, $F(3) = 0.5$, $F(4) = 0.8$, $F(5) = 1$, and we observe $y = 4$ ("increase").  The PIT value is selected uniformly at random on the interval $[0.5, 0.8]$.
+
+The use of random numbers in the computation of the PIT values introduces some (extra) random noise into measures of forecast calibration. This should have limited impact in large sample sizes, but could be undesirable. If multiple runs of the procedure produce substantively different results, indicating sensitivity to this random number generation, multiple Monte Carlo realizations of PIT values could be generated for each forecast to reduce the impact of this randomness on scores. In the below, I generate 100 PIT values for each forecast.
+
+# KL divergence of the (empirical) distribution of PIT values from Unif(0, 1)
+
+As discussed above, if a forecaster's predictions are probabilistically calibrated, their PIT values follow a uniform distribution on the interval from 0 to 1. One way to examine calibration of a forecaster is to examine a histogram of their PIT values across many predictions.
+
+If a single numeric summary of calibration is desired, one option is to compute a measure of divergence of the distribution of PIT values from a $Unif(0, 1)$ distribution. For this purpose, Rumack et al. propose the use of KL divergence, or equivalently the negative entropy of the PIT distribution. I find it easier to think about divergence than entropy, so I'm using that here. A low divergence indicates good probabilistic calibration.
+ 
+Following the procedure in Rumack et al., we'll estimate this entropy based on a histogram representation of the distribution of PIT values with 100 equal-sized bins on the interval from 0 to 1. The number of histogram bins used to compute the KL divergence is a tuning parameter of the measure of calibration, and there is no specific jsutification for the choice of 100 bins. Below I illustrate that rankings of forecast calibration by model are somewhat sensitive to this choice; e.g., one model is ranked 10/25 when 100 bins are used, but 3/25 when 20 bins are used. This is unfortunate...
+
+# Examples
+
+```{r}
+library(hubUtils)
+library(tidyverse)
+
+library(DT)
+library(plotly)
+
+set.seed(42)
+```
+
+```{r}
+hub_path <- "../../../epi/flu/FluSight-forecast-hub"
+
+hub_con <- connect_hub(hub_path)
+forecasts <- hub_con |>
+  dplyr::filter(
+    output_type == "pmf"
+  ) |>
+  dplyr::collect() |>
+  as_model_out_tbl() |>
+  dplyr::filter(horizon >= 0,
+                reference_date >= "2023-10-14",
+                location != "US",
+                location != "78")
+```
+
+Observed category levels -- code borrowed from a draft report by Sarabeth Mathis.
+
+```{r}
+# load location data 
+location_data <- readr::read_csv(file = "https://raw.githubusercontent.com/cdcepi/FluSight-forecast-hub/main/auxiliary-data/locations.csv") %>%
+  dplyr::select(location,location_name, count_rate1, count_rate2, count_rate2p5, count_rate3, count_rate4, count_rate5)
+
+# load target and merge with location data
+#    filter most recent target
+#    set rate, diff, criteria
+weekly_data_all <- readr::read_csv(file = "https://raw.githubusercontent.com/cdcepi/FluSight-forecast-hub/main/target-data/target-hospital-admissions.csv") %>% 
+  filter(date >= as.Date("2023-10-01")) %>%
+  select(-c(`...1`, location))%>%
+  dplyr::inner_join(location_data,
+                    by = c("location_name")) 
+
+weekly_rate_differences <- weekly_data_all %>% group_by(location_name) %>% arrange(date) %>% 
+  mutate(rate_diff0 = weekly_rate - lag(weekly_rate, 1), 
+         rate_diff1 = weekly_rate - lag(weekly_rate, 2), 
+         rate_diff2 = weekly_rate - lag(weekly_rate, 3), 
+         rate_diff3 = weekly_rate - lag(weekly_rate, 4)) %>% 
+  ungroup() %>% 
+  pivot_longer(cols = c(rate_diff0, rate_diff1, rate_diff2, rate_diff3), names_to = "horizon", names_prefix = "rate_diff", values_to = "rate_diff", names_transform = list(horizon = as.integer)) %>% 
+  mutate(category = case_when(value < 10 | horizon == 0 & rate_diff < 1 ~ "stable",
+                              horizon == 0 & rate_diff > 2 ~ "large_increase", 
+                              horizon == 0 & rate_diff < -2 ~ "large_decrease", 
+                              horizon == 0 & rate_diff >= 1 ~ "increase", 
+                              horizon == 0 & rate_diff <= -1 ~ "decrease", 
+                              value < 10 | horizon == 1 & rate_diff < 1 ~ "stable", 
+                              horizon == 1 & rate_diff > 3 ~ "large_increase", 
+                              horizon == 1 & rate_diff < -3 ~ "large_decrease", 
+                              horizon == 1 & rate_diff >= 1 ~ "increase", 
+                              horizon == 1 & rate_diff <= -1 ~ "decrease", 
+                              value < 10 | horizon == 2 & rate_diff < 2 ~ "stable", 
+                              horizon == 2 & rate_diff > 4 ~ "large_increase", 
+                              horizon == 2 & rate_diff < -4 ~ "large_decrease", 
+                              horizon == 2 & rate_diff >= 2 ~ "increase", 
+                              horizon == 2 & rate_diff <= -2 ~ "decrease", 
+                              value < 10 | horizon == 3 & rate_diff < 2.5 ~ "stable", 
+                              horizon == 3 & rate_diff > 5 ~ "large_increase", 
+                              horizon == 3 & rate_diff < -5 ~ "large_decrease", 
+                              horizon == 3 & rate_diff >= 2.5 ~ "increase", 
+                              horizon == 3 & rate_diff <= -2.5 ~ "decrease")) %>% select(date, location_name, location, horizon, rate_diff, category)
+```
+
+```{r}
+forecasts <- forecasts |>
+  mutate(
+    output_type_id = factor(
+      output_type_id,
+      levels = c("large_decrease", "decrease", "stable", "increase", "large_increase"),
+      ordered = TRUE),
+    cat_lvl = as.integer(output_type_id)
+  ) |>
+  group_by(model_id, location, reference_date, horizon, target_end_date) |>
+  arrange(cat_lvl) |>
+  mutate(cdf = cumsum(value)) |>
+  mutate(cdf_lower_cat = dplyr::lag(cdf, 1, default = 0))
+```
+
+Here's an example showing the results of the calculations we just did for one forecast:
+
+```{r}
+forecasts |>
+  ungroup() |>
+  filter(model_id == "FluSight-ensemble", reference_date == "2024-01-13",
+         horizon == 3, location == "45") |>
+  select(output_type_id, cat_lvl, value, cdf, cdf_lower_cat)
+```
+
+We merge observed target categories and forecasts (dropping forecasts for unobserved categories) and compute the PIT values for each forecast. Note that we generate 100 PIT values for each forecast in an attempt to limit Monte Carlo variability of the results.
+
+```{r}
+pit_values <- inner_join(
+    forecasts,
+    weekly_rate_differences,
+    by = join_by(location == location, reference_date == date, horizon == horizon,
+                 output_type_id == category)) |>
+  mutate(
+    pit = list(runif(n = 100, min = cdf_lower_cat, max = cdf))
+  )
+```
+
+Here's the result for our example:
+
+```{r}
+selected_forecast <- pit_values |>
+  filter(model_id == "FluSight-ensemble", reference_date == "2024-01-13",
+                horizon == 3, location == "45") |>
+  select(output_type_id, cat_lvl, value, cdf, cdf_lower_cat, pit)
+
+print(selected_forecast)
+print(selected_forecast$pit)
+```
+
+One approach to summarizing the pit values: histograms for each forecaster:
+
+```{r, fig.width=10}
+ggplot(data = unnest(pit_values, cols = "pit")) +
+  geom_histogram(mapping = aes(x = pit, y = after_stat(density)), boundary = 0) +
+  facet_wrap( ~ model_id)
+```
+
+A few example interpretations:
+
+- LosAlamos_NAU-CModel_Flu is overconfident
+- UMass-trends_ensemble is underconfident
+- SGroup-RandomForest assigns mass to categories that are less than the one that was observed more often than it should
+
+We can also compute a numeric summary of how far each model's distribution of PIT scores is from uniform, here using KL divergence based on 100 bins.  A lower divergence from the uniform distribution indicates better probabilistic calibration.
+
+```{r}
+get_pit_kl_div_by_model <- function(pit_values, num_bins) {
+  pit_kl_div_by_model <- pit_values |>
+    unnest(cols = "pit") |>
+    group_by(model_id) |>
+    summarize(
+      pit_kl_div = KL.empirical(
+        hist(pit, breaks = seq(from = 0.0, to = 1.0, by = 1 / num_bins), plot = FALSE)$counts,
+        length(pit) * rep(1 / num_bins, num_bins)
+      )
+    ) |>
+    arrange(pit_kl_div)
+  
+  return(pit_kl_div_by_model)
+}
+
+datatable(get_pit_kl_div_by_model(pit_values, num_bins = 100))
+```
+
+The results look a little different when using 20 bins instead of 100:
+
+```{r}
+datatable(get_pit_kl_div_by_model(pit_values, num_bins = 20))
+```
+
+Here's a look at how ranks change as a function of the number of bins used (lower ranks, toward the bottom of the plot, indicate better calibration):
+```{r}
+kl_div_by_model <- purrr::map(
+  seq(from = 10, to = 200, by = 10),
+  function(num_bins) {
+    get_pit_kl_div_by_model(pit_values, num_bins = num_bins) |>
+      mutate(
+        rank = rank(pit_kl_div),
+        num_bins = num_bins
+      )
+  }) |>
+  purrr::list_rbind()
+```
+
+```{r}
+p <- ggplot(data = kl_div_by_model) +
+  geom_line(mapping = aes(x = num_bins, y = rank, color = model_id))
+
+ggplotly(p)
+```
+
+Maybe a reasonable option here is to just choose a fairly large number of bins?  There aren't that many rank switches after 100 bins...
+
+As another alternative, it might be possible to skip the sampling of PITs and the binning here, and get to an exact computation of the measure of divergence we're after.  For a single forecast, the PIT value follows a uniform distribution: $Z_i \sim Unif(l_i, u_i)$ as described above. Then collecting across all forecasts in our evaluation set, if I draw a single PIT score, that score comes from a mixture of uniform distributions. It may be possible to arrive at an exact result for the divergence of that mixture of uniforms from a $Unif(0, 1)$ distribution.
