@@ -1,0 +1,418 @@
+---
+title: "Measuring calibration of ordinal forecasts"
+author: "Evan L. Ray"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, cache = TRUE)
+```
+
+# Introduction
+
+In this document, I conduct a small simulation study to investigate the use of raking to correct for biased sampling.
+
+We will investigate the use of raking with a single covariate, the location (MA county) where a sample was collected.
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(extraDistr)
+library(anesrake)
+library(weights)
+```
+
+We obtained the following population data for MA counties as of 2023 from the US Census:
+```{r}
+# load in data with population per county in MA
+pops <- readr::read_csv("ma_county_populations.csv") |>
+  dplyr::filter(location != "Massachusetts") |>
+  dplyr::select(location, pop = `2023`) |>
+  dplyr::mutate(
+    location = stringr::str_extract(location, "^.+?\\ "),
+    location = substr(location, 1, nchar(location) - 1),
+    prop_pop = pop / sum(pop)
+  )
+pops
+```
+
+Here we generate a simulated "population" of infected people in each county, based on the following assumptions:
+- In all counties, the infection rate is 100/100,000.
+- Each county has a different mix of clade proportions, roughly centered around 10% clade A, 30% clade B, 60% clade C
+
+```{r}
+# set up a "population" of infected people
+set.seed(42)
+mean_clade_props <- c(0.1, 0.3, 0.6)
+n_clades <- length(mean_clade_props)
+clade_names <- LETTERS[seq_along(mean_clade_props)]
+clade_props_by_county <- rdirichlet(alpha = mean_clade_props * 100,
+                                    n = nrow(pops)) |>
+  `colnames<-`(clade_names) |>
+  as.data.frame()
+
+# for all counties,
+# assume 5/100,000 hospitalization rate
+# and 5% infection/hospitalization rate, i.e. 20 infections per hospitalization
+# gets us to a 100/100,000 infection rate
+pops$inf_count <- pops$pop * 5 / 100000 * 20
+clade_inf_by_county <- round(clade_props_by_county * pops$inf_count)
+print(cbind(pops["location"], clade_inf_by_county))
+
+# the "realized" clade proportions in each county:
+print(cbind(pops["location"],
+            sweep(clade_inf_by_county,
+                  1,
+                  apply(clade_inf_by_county, 1, sum),
+                  "/")))
+```
+
+Our goal is to obtain estimates of the proportion of all infections that are from each clade, state-wide:
+```{r}
+# population proportions to estimate
+clade_counts <- apply(clade_inf_by_county, 2, sum)
+clade_props <- clade_counts / sum(clade_counts)
+print(clade_props)
+```
+
+Now we draw a sample of 100 infections, with the following assumptions:
+
+- About 80% of the samples come from Worcester county and the other counties contribute samples with probability proportional to their population size.
+- Within each county, any infected individual has equal probability of being selected for sequencing.
+```{r}
+# draw a sample of 100 infections
+# more samples from Worcester county; other counties proportional to size
+# equal probability of observing any infected person
+# (e.g., not more likely to observe some variants than others)
+sample_size <- 100
+sampling_prob_by_county <- data.frame(
+  location = c("Barnstable", "Berkshire", "Bristol", "Dukes", "Essex",
+               "Franklin", "Hampden", "Hampshire", "Middlesex",
+               "Nantucket", "Norfolk", "Plymouth", "Suffolk", "Worcester")
+) |>
+  dplyr::left_join(
+    pops |>
+      dplyr::select(location, pop) |>
+      dplyr::filter(location != "Worcester") |>
+      dplyr::mutate(rel_pop = pop / sum(pop)),
+    by = "location"
+  ) |>
+  dplyr::mutate(
+    sampling_prob = ifelse(
+      location == "Worcester",
+      0.8,
+      0.2 * rel_pop
+    )
+  )
+
+# draw the sample:
+# first, select location with probabilities found above
+# then, select individuals
+sample_counts_by_county <- rmultinom(
+  n = 1,
+  size = sample_size,
+  prob = sampling_prob_by_county$sampling_prob
+)[, 1]
+
+sample_one_county <- function(i, count) {
+  infs <- rep(clade_names, times = clade_inf_by_county[i, ])
+  if (count > length(infs)) {
+    stop("count too large!")
+  }
+
+  sample(infs, size = count) |>
+    factor(levels = clade_names) |>
+    table() |>
+    unname()
+}
+
+samples_by_county <- purrr::map2(
+  seq_along(sample_counts_by_county), sample_counts_by_county,
+  function(i, count) {
+    matrix(sample_one_county(i, count), nrow = 1)
+  }
+)
+samples_by_county <- do.call(rbind, samples_by_county)
+colnames(samples_by_county) <- clade_names
+print(cbind(pops["location"], as.data.frame(samples_by_county)))
+```
+
+Now, we compute two estimates:
+
+1. A naive estimate, obtained as the proportion of each variant in our sample, aggregating across all counties
+2. An estimate based on raking, which downweights samples from Worcester county and upweights samples from other counties
+
+```{r}
+# naive estimate: aggregate across counties, compute proportion
+naive_est <- apply(samples_by_county, 2, sum)
+naive_est <- naive_est / sum(naive_est)
+names(naive_est) <- clade_names
+print(naive_est)
+```
+
+```{r}
+# raking-based estimate: apply raking to get weights based on number of
+# infections in each county (assumed known)
+
+# our target weighting per county: proportional to total infection count
+inf_prop_by_county <- data.frame(
+  location = pops$location,
+  inf = apply(clade_inf_by_county, 1, sum)
+) |>
+  dplyr::mutate(
+    inf_prop = inf / sum(inf)
+  )
+targets <- list(
+  location = inf_prop_by_county$inf_prop
+)
+names(targets$location) <- inf_prop_by_county$location
+print(targets)
+
+# get to a line list format for sequences
+samples_linelist <- samples_by_county |>
+  as.data.frame() |>
+  dplyr::mutate(location = pops$location) |>
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(clade_names),
+    names_to = "clade",
+    values_to = "count"
+  ) |>
+  dplyr::filter(count > 0) |>
+  dplyr::group_by(location, clade) |>
+  dplyr::mutate(
+    clade = list(rep(clade, count))
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(-count) |>
+  tidyr::unnest(clade) |>
+  dplyr::mutate(
+    caseid = row_number(),
+    location = factor(location, levels = pops$location)
+  )
+head(samples_linelist)
+
+# estimate weights by raking
+raking_output <- anesrake(
+  inputter = targets,
+  dataframe = as.data.frame(samples_linelist),
+  caseid = samples_linelist$caseid,
+  verbose = FALSE,
+  cap = 5,
+  choosemethod = "total",
+  type = "pctlim",
+  pctlim = .05,
+  nlim = 5,
+  iterate = TRUE,
+  force1 = TRUE
+)
+
+# the weights assigned to observations from each county:
+cbind(samples_linelist, raking_output["weightvec"]) |>
+  dplyr::distinct(location, weightvec)
+
+# average weight across all observations in the sample is 1
+mean(raking_output$weightvec)
+
+# compute the raking estimate as a weighted sample proportion
+raking_est <- wpct(samples_linelist$clade, raking_output$weightvec)
+
+# compare naive and raking estimates to population values
+print(naive_est)
+print(raking_est)
+print(clade_props)
+```
+
+# Estimates across repeated samples
+
+We keep the simulated "population" of infected people above fixed, and investigate performance of the naive and raking-based estimators across repeated samples of cases from that population to select for sequencing. The sampling mechanism is the same as above (100 sequences, about 80% from Worcester county, the remaining coming from other counties proportional to size).
+
+```{r, results='hide'}
+draw_samples_by_county <- function() {
+  sample_counts_by_county <- rmultinom(
+    n = 1,
+    size = sample_size,
+    prob = sampling_prob_by_county$sampling_prob
+  )[, 1]
+
+  samples_by_county <- purrr::map2(
+    seq_along(sample_counts_by_county), sample_counts_by_county,
+    function(i, count) {
+      matrix(sample_one_county(i, count), nrow = 1)
+    }
+  )
+  samples_by_county <- do.call(rbind, samples_by_county)
+  colnames(samples_by_county) <- clade_names
+
+  return(samples_by_county)
+}
+
+get_raking_est <- function(targets, samples_by_county) {
+  # get to a line list format for sequences
+  samples_linelist <- samples_by_county |>
+    as.data.frame() |>
+    dplyr::mutate(location = pops$location) |>
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(clade_names),
+      names_to = "clade",
+      values_to = "count"
+    ) |>
+    dplyr::filter(count > 0) |>
+    dplyr::group_by(location, clade) |>
+    dplyr::mutate(
+      clade = list(rep(clade, count))
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::select(-count) |>
+    tidyr::unnest(clade) |>
+    dplyr::mutate(
+      caseid = row_number(),
+      location = factor(location, levels = pops$location)
+    )
+
+  # estimate weights by raking
+  raking_output <- anesrake(
+    inputter = targets,
+    dataframe = as.data.frame(samples_linelist),
+    caseid = samples_linelist$caseid,
+    verbose = FALSE,
+    cap = 5,
+    choosemethod = "total",
+    type = "pctlim",
+    pctlim = .05,
+    nlim = 5,
+    iterate = TRUE,
+    force1 = TRUE
+  )
+
+  # compute the raking estimate as a weighted sample proportion
+  raking_est <- wpct(samples_linelist$clade, raking_output$weightvec)
+
+  return(raking_est)
+}
+
+do_one_replicate <- function(i) {
+  samples_by_county <- draw_samples_by_county()
+
+  # naive estimate: aggregate across counties, compute proportion
+  est_naive <- apply(samples_by_county, 2, sum)
+  est_naive <- est_naive / sum(est_naive)
+  names(est_naive) <- clade_names
+
+  # raking estimate
+  est_raking <- get_raking_est(targets, samples_by_county)
+
+  # combine into data frame
+  result <- as.data.frame(cbind(est_naive, est_raking))
+  result$replicate <- i
+  result$clade <- rownames(result)
+  rownames(result) <- NULL
+
+  return(result)
+}
+
+n_replicates <- 1000
+sim_results <- purrr::map(seq_len(n_replicates), do_one_replicate) |>
+  purrr::list_rbind()
+```
+
+Plotting (the sampling distribution of) the resulting estimates
+```{r}
+ggplot(
+  data = sim_results |>
+    tidyr::pivot_longer(
+      cols = c("est_naive", "est_raking"),
+      names_to = "method",
+      names_prefix = "est_",
+      values_to = "estimate"
+    )) +
+  geom_boxplot(mapping = aes(x = clade, y = estimate, color = method)) +
+  geom_point(
+    data = as.data.frame(clade_props) |>
+      dplyr::mutate(clade = c("A", "B", "C")),
+    mapping = aes(x = clade, y = clade_props),
+    size = 10,
+    shape = "—"
+  ) +
+  theme_bw()
+```
+
+```{r}
+ggplot(
+  data = sim_results |>
+    tidyr::pivot_longer(
+      cols = c("est_naive", "est_raking"),
+      names_to = "method",
+      names_prefix = "est_",
+      values_to = "estimate"
+    )) +
+  geom_violin(mapping = aes(x = clade, y = estimate, color = method)) +
+  geom_point(
+    data = as.data.frame(clade_props) |>
+      dplyr::mutate(clade = c("A", "B", "C")),
+    mapping = aes(x = clade, y = clade_props),
+    size = 10,
+    shape = "—"
+  ) +
+  theme_bw()
+```
+
+Here we'll look at mean squared errors of the estimates from each method for each clade:
+```{r}
+sim_results |>
+  tidyr::pivot_longer(
+    cols = c("est_naive", "est_raking"),
+    names_to = "method",
+    names_prefix = "est_",
+    values_to = "estimate"
+  ) |>
+  dplyr::left_join(
+    as.data.frame(clade_props) |>
+      dplyr::mutate(clade = c("A", "B", "C")),
+    by = "clade"
+  ) |>
+  dplyr::mutate(
+    error = estimate - clade_props,
+    sq_error = error^2,
+    abs_error = abs(error)
+  ) |>
+  dplyr::group_by(method, clade) |>
+  dplyr::summarize(
+    MSE = mean(sq_error),
+    MAE = mean(abs_error)
+  ) |>
+  tidyr::pivot_longer(
+    cols = c("MSE", "MAE"),
+    names_to = "metric_name",
+    values_to = "metric_value") |>
+  ggplot() +
+    geom_point(
+      mapping = aes(x = clade, y = metric_value, color = method)
+    ) +
+    facet_wrap( ~ metric_name, ncol = 1, scales = "free_y") +
+    theme_bw()
+```
+
+Take-aways:
+
+- The average or median estimate is better when using raking
+- But the average difference between the estimate and the actual proportions is smaller when using the naive approach! (same for the average squared difference)
+- This is an example of a "bias-variance tradeoff": we can get reduced bias, but in order to do that we introduce more variability in estimates. We have to decide if the tradeoff is worth it.
+
+Notes:
+
+- Likely these results are sensitive to the details here: maybe raking would be a better approach more consistently across samples if Worcester's proportions were farther from the statewide proportions.  It may also depend on the sample size.  But this indicates some caution is required before jumping aboard the raking bandwagon: do we expect to see gains in practice?
+- Above, there were ~27 warnings (out of 1000 replicates) for samples where raking didn't converge.  This means it was not able to find sample weights so that the weighted sample proportions aligned with the target proportions of infections in each county.  Perhaps if we used a hybrid strategy that used the naive estimate in those instances, we'd do better?
+- There are a number of tuning parameters for the raking procedure that could help, e.g. maximum values on the weights (set to 5 here).
+
+# Open questions
+
+ - Are there important ways to adjust this setup to be more realistic?
+ - Handling more than 1 demographic covariate (e.g. race/ethnicity in addition to location)
+ - Getting estimates of uncertainty
+ - Getting estimates based on samples collected across multiple weeks
+ - What are impacts of bias in which cases are selected for sequencing
+    - by clade, e.g. maybe clade A is more prevalent but less severe, so fewer people get tested/sequenced
+    - by other factors that may be associated with clade but are not controlled for in the analysis?
+ - ...
