@@ -1,5 +1,5 @@
 ---
-title: "Measuring calibration of ordinal forecasts"
+title: "Simulation to explore raking"
 author: "Evan L. Ray"
 date: "`r Sys.Date()`"
 output: html_document
