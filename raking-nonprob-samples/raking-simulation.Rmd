@@ -22,6 +22,7 @@ library(tidyverse)
 library(extraDistr)
 library(anesrake)
 library(weights)
+library(survey)
 ```
 
 We obtained the following population data for MA counties as of 2023 from the US Census:
@@ -116,7 +117,7 @@ sample_counts_by_county <- rmultinom(
   prob = sampling_prob_by_county$sampling_prob
 )[, 1]
 
-sample_one_county <- function(i, count) {
+sample_one_county <- function(i, count, clade_inf_by_county) {
   infs <- rep(clade_names, times = clade_inf_by_county[i, ])
   if (count > length(infs)) {
     stop("count too large!")
@@ -131,46 +132,14 @@ sample_one_county <- function(i, count) {
 samples_by_county <- purrr::map2(
   seq_along(sample_counts_by_county), sample_counts_by_county,
   function(i, count) {
-    matrix(sample_one_county(i, count), nrow = 1)
+    matrix(sample_one_county(i, count, clade_inf_by_county), nrow = 1)
   }
 )
 samples_by_county <- do.call(rbind, samples_by_county)
 colnames(samples_by_county) <- clade_names
 print(cbind(pops["location"], as.data.frame(samples_by_county)))
-```
 
-Now, we compute two estimates:
-
-1. A naive estimate, obtained as the proportion of each variant in our sample, aggregating across all counties
-2. An estimate based on raking, which downweights samples from Worcester county and upweights samples from other counties
-
-```{r}
-# naive estimate: aggregate across counties, compute proportion
-naive_est <- apply(samples_by_county, 2, sum)
-naive_est <- naive_est / sum(naive_est)
-names(naive_est) <- clade_names
-print(naive_est)
-```
-
-```{r}
-# raking-based estimate: apply raking to get weights based on number of
-# infections in each county (assumed known)
-
-# our target weighting per county: proportional to total infection count
-inf_prop_by_county <- data.frame(
-  location = pops$location,
-  inf = apply(clade_inf_by_county, 1, sum)
-) |>
-  dplyr::mutate(
-    inf_prop = inf / sum(inf)
-  )
-targets <- list(
-  location = inf_prop_by_county$inf_prop
-)
-names(targets$location) <- inf_prop_by_county$location
-print(targets)
-
-# get to a line list format for sequences
+# get to a line list format for sequences, needed for some analyses below
 samples_linelist <- samples_by_county |>
   as.data.frame() |>
   dplyr::mutate(location = pops$location) |>
@@ -188,15 +157,117 @@ samples_linelist <- samples_by_county |>
   dplyr::select(-count) |>
   tidyr::unnest(clade) |>
   dplyr::mutate(
-    caseid = row_number(),
-    location = factor(location, levels = pops$location)
+    caseid = row_number()#,
+    # location = factor(location, levels = pops$location)
   )
 head(samples_linelist)
+```
 
-# estimate weights by raking
-raking_output <- anesrake(
-  inputter = targets,
-  dataframe = as.data.frame(samples_linelist),
+Now, we compute two kind of estimates:
+
+1. A naive estimate, obtained as the proportion of each variant in our sample, aggregating across all counties
+2. Estimates based on raking, which downweight samples from Worcester county and upweight samples from other counties
+
+```{r}
+# naive estimate: aggregate across counties, compute proportion
+naive_est <- apply(samples_by_county, 2, sum)
+naive_est <- naive_est / sum(naive_est)
+naive_est <- data.frame(
+  clade = clade_names,
+  estimate = naive_est
+)
+print(naive_est)
+```
+
+We can also obtain confidence intervals for these proportions through a variety of methods. Here's one option, from [this stackoverflow post](https://stackoverflow.com/questions/76320119/is-there-a-way-to-estimate-multinomial-proportions-with-confidence-intervals-usi) (this may not be the best approach?):
+```{r}
+dat_design <- suppressWarnings(svydesign(~ 1, data = samples_linelist)) # convert data to survey design
+
+f <- function(clade, design) {
+  est <- eval(bquote(
+    svyciprop(~ I(clade == .(clade)), design, method = "xlogit")
+  ))
+  result <- data.frame(
+    clade = clade,
+    estimate = as.numeric(est),
+    ci_lower = attr(est, "ci")[1],
+    ci_upper = attr(est, "ci")[2]
+  )
+  row.names(result) <- 1L
+  return(result)
+}
+est_with_ci_naive <- purrr::map(clade_names, f, design = dat_design) |>
+  purrr::list_rbind()
+```
+
+And we can obtain bootstrap confidence intervals as follows:
+```{r}
+dat_design_bs <- as.svrepdesign(dat_design, type = "bootstrap")
+est_with_ci_bs <- purrr::map(clade_names, f, design = dat_design_bs) |>
+  purrr::list_rbind()
+row.names(est_with_ci_bs) <- NULL
+```
+
+Now, with raking:
+```{r}
+# our target weighting per county: proportional to total infection count
+inf_prop_by_county <- data.frame(
+  location = pops$location,
+  inf = apply(clade_inf_by_county, 1, sum)
+) |>
+  dplyr::filter(location %in% unique(samples_linelist$location)) |>
+  dplyr::mutate(
+    inf_prop = inf / sum(inf)
+  )
+targets_survey <- list(
+  inf_prop_by_county |>
+    dplyr::select(location, Freq = inf) |>
+    as.data.frame()
+)
+print(targets_survey)
+
+dat_design_raked <- rake(
+  dat_design,
+  sample.margins = list(~ location),
+  population.margins = targets_survey
+)
+
+# how many population members is each person in the sample accounting for?
+attr(dat_design_raked$postStrata[[1]][[1]], "weights")
+
+# Another method that didn't work in my first try
+# I think this might work with better choices for bounds and trim, though.
+
+# dat_design_raked <- calibrate(
+#   dat_design,
+#   formula = ~ location, # list of formulas specifying raking variables
+# #   population = xtabs(~location, samples_linelist),
+#   population = targets$location, # list of data frames showing desired counts
+#   bounds = c(0.1, 10),
+#   trim = c(0.2, 5),
+#   force = TUE
+# )
+
+est_with_ci_raked <- purrr::map(clade_names, f, design = dat_design_raked) |>
+  purrr::list_rbind()
+```
+
+The below tries out a different package, which allows us to specify a limit on the magnitude of the weights.  We'll see why this matters below.
+
+```{r}
+# raking-based estimate using the anesrake package
+
+# our target weighting per county: proportional to total infection count
+targets_anesrake <- list(
+  location = inf_prop_by_county$inf_prop
+)
+names(targets_anesrake$location) <- inf_prop_by_county$location
+print(targets_anesrake)
+
+# estimate weights by raking, with a maximum weight of 5
+raking_output_cap5 <- anesrake(
+  inputter = targets_anesrake,
+  dataframe = as.data.frame(samples_linelist |> dplyr::mutate(location = factor(location))),
   caseid = samples_linelist$caseid,
   verbose = FALSE,
   cap = 5,
@@ -209,27 +280,56 @@ raking_output <- anesrake(
 )
 
 # the weights assigned to observations from each county:
-cbind(samples_linelist, raking_output["weightvec"]) |>
+cbind(samples_linelist, raking_output_cap5["weightvec"]) |>
   dplyr::distinct(location, weightvec)
 
 # average weight across all observations in the sample is 1
-mean(raking_output$weightvec)
+mean(raking_output_cap5$weightvec)
 
 # compute the raking estimate as a weighted sample proportion
-raking_est <- wpct(samples_linelist$clade, raking_output$weightvec)
+# this package does not provide the option to get interval estimates
+raking_est_cap5 <- data.frame(
+  clade = clade_names,
+  est = wpct(samples_linelist$clade, raking_output_cap5$weightvec)
+)
+
+# estimate weights by raking, with a maximum weight of 2
+raking_output_cap2 <- anesrake(
+  inputter = targets_anesrake,
+  dataframe = as.data.frame(samples_linelist |> dplyr::mutate(location = factor(location))),
+  caseid = samples_linelist$caseid,
+  verbose = FALSE,
+  cap = 2,
+  choosemethod = "total",
+  type = "pctlim",
+  pctlim = .05,
+  nlim = 5,
+  iterate = TRUE,
+  force1 = TRUE
+)
+
+raking_est_cap2 <- data.frame(
+  clade = clade_names,
+  est = wpct(samples_linelist$clade, raking_output_cap2$weightvec)
+)
 
 # compare naive and raking estimates to population values
-print(naive_est)
-print(raking_est)
+print(est_with_ci_naive)
+print(est_with_ci_bs)
+print(raking_est_cap2)
+print(raking_est_cap5)
+print(est_with_ci_raked)
 print(clade_props)
 ```
 
 # Estimates across repeated samples
 
+## Simulation 1: overrepresented county similar to overall population
+
 We keep the simulated "population" of infected people above fixed, and investigate performance of the naive and raking-based estimators across repeated samples of cases from that population to select for sequencing. The sampling mechanism is the same as above (100 sequences, about 80% from Worcester county, the remaining coming from other counties proportional to size).
 
 ```{r, results='hide'}
-draw_samples_by_county <- function() {
+draw_samples_linelist <- function(clade_inf_by_county) {
   sample_counts_by_county <- rmultinom(
     n = 1,
     size = sample_size,
@@ -239,16 +339,12 @@ draw_samples_by_county <- function() {
   samples_by_county <- purrr::map2(
     seq_along(sample_counts_by_county), sample_counts_by_county,
     function(i, count) {
-      matrix(sample_one_county(i, count), nrow = 1)
+      matrix(sample_one_county(i, count, clade_inf_by_county), nrow = 1)
     }
   )
   samples_by_county <- do.call(rbind, samples_by_county)
   colnames(samples_by_county) <- clade_names
 
-  return(samples_by_county)
-}
-
-get_raking_est <- function(targets, samples_by_county) {
   # get to a line list format for sequences
   samples_linelist <- samples_by_county |>
     as.data.frame() |>
@@ -271,13 +367,22 @@ get_raking_est <- function(targets, samples_by_county) {
       location = factor(location, levels = pops$location)
     )
 
+  return(samples_linelist)
+}
+
+get_est_anesrake <- function(inf_prop_by_county, samples_linelist, cap) {
+  targets <- list(
+    location = inf_prop_by_county$inf_prop
+  )
+  names(targets$location) <- inf_prop_by_county$location
+
   # estimate weights by raking
   raking_output <- anesrake(
     inputter = targets,
-    dataframe = as.data.frame(samples_linelist),
+    dataframe = as.data.frame(samples_linelist |> dplyr::mutate(location = factor(location))),
     caseid = samples_linelist$caseid,
     verbose = FALSE,
-    cap = 5,
+    cap = cap,
     choosemethod = "total",
     type = "pctlim",
     pctlim = .05,
@@ -287,86 +392,130 @@ get_raking_est <- function(targets, samples_by_county) {
   )
 
   # compute the raking estimate as a weighted sample proportion
-  raking_est <- wpct(samples_linelist$clade, raking_output$weightvec)
+  result <- data.frame(
+    clade = clade_names,
+    estimate = wpct(samples_linelist$clade, raking_output$weightvec),
+    method = paste0("anesrake_cap", cap)
+  )
 
-  return(raking_est)
+  return(result)
 }
 
-do_one_replicate <- function(i) {
-  samples_by_county <- draw_samples_by_county()
+get_est_survey <- function(inf_prop_by_county, samples_linelist, bootstrap=FALSE, rake=FALSE) {
+  method <- "naive"
+  dat_design <- suppressWarnings(svydesign(~ 1, data = samples_linelist)) # convert data to survey design
+
+  if (bootstrap) {
+    method <- "naive_bs"
+    dat_design <- as.svrepdesign(dat_design, type = "bootstrap")
+  }
+
+  if (rake) {
+    method <- "rake"
+    targets <- list(
+      inf_prop_by_county |>
+        dplyr::filter(location %in% unique(samples_linelist$location)) |>
+        dplyr::select(location, Freq = inf) |>
+        as.data.frame()
+    )
+
+    dat_design <- rake(
+      dat_design,
+      sample.margins = list(~ location),
+      population.margins = targets
+    )
+  }
+
+  f <- function(clade, design) {
+    est <- eval(bquote(
+      svyciprop(~ I(clade == .(clade)), design, method = "xlogit")
+    ))
+    result <- data.frame(
+      clade = clade,
+      estimate = as.numeric(est),
+      ci_lower = attr(est, "ci")[1],
+      ci_upper = attr(est, "ci")[2]
+    )
+    row.names(result) <- 1L
+    return(result)
+  }
+
+  est_with_ci <- purrr::map(clade_names, f, design = dat_design) |>
+    purrr::list_rbind() |>
+    dplyr::mutate(
+      method = method
+    )
+
+  return(est_with_ci)
+}
+
+do_one_replicate <- function(i, clade_inf_by_county) {
+  samples_linelist <- draw_samples_linelist(clade_inf_by_county)
+
+  inf_prop_by_county <- data.frame(
+    location = pops$location,
+    inf = apply(clade_inf_by_county, 1, sum)
+  ) |>
+    dplyr::filter(location %in% unique(samples_linelist$location)) |>
+    dplyr::mutate(
+      inf_prop = inf / sum(inf)
+    )
 
   # naive estimate: aggregate across counties, compute proportion
-  est_naive <- apply(samples_by_county, 2, sum)
-  est_naive <- est_naive / sum(est_naive)
-  names(est_naive) <- clade_names
-
-  # raking estimate
-  est_raking <- get_raking_est(targets, samples_by_county)
-
-  # combine into data frame
-  result <- as.data.frame(cbind(est_naive, est_raking))
-  result$replicate <- i
-  result$clade <- rownames(result)
-  rownames(result) <- NULL
+  result <- dplyr::bind_rows(
+    get_est_anesrake(inf_prop_by_county, samples_linelist, cap = 2),
+    get_est_anesrake(inf_prop_by_county, samples_linelist, cap = 5),
+    get_est_survey(inf_prop_by_county, samples_linelist, bootstrap=FALSE, rake=FALSE),
+    # get_est_survey(inf_prop_by_county, samples_linelist, bootstrap=TRUE, rake=FALSE),
+    get_est_survey(inf_prop_by_county, samples_linelist, bootstrap=FALSE, rake=TRUE)
+  )
 
   return(result)
 }
 
 n_replicates <- 1000
-sim_results <- purrr::map(seq_len(n_replicates), do_one_replicate) |>
+set.seed(42)
+sim_results <- purrr::map(seq_len(n_replicates), do_one_replicate, clade_inf_by_county=clade_inf_by_county) |>
   purrr::list_rbind()
+```
+
+```{r}
+sim_results$method <- factor(
+  sim_results$method,
+  levels = c("naive", "anesrake_cap2", "anesrake_cap5", "rake")
+)
 ```
 
 Plotting (the sampling distribution of) the resulting estimates
 ```{r}
-ggplot(
-  data = sim_results |>
-    tidyr::pivot_longer(
-      cols = c("est_naive", "est_raking"),
-      names_to = "method",
-      names_prefix = "est_",
-      values_to = "estimate"
-    )) +
+ggplot(data = sim_results) +
   geom_boxplot(mapping = aes(x = clade, y = estimate, color = method)) +
   geom_point(
     data = as.data.frame(clade_props) |>
       dplyr::mutate(clade = c("A", "B", "C")),
     mapping = aes(x = clade, y = clade_props),
-    size = 10,
+    size = 15,
     shape = "—"
   ) +
   theme_bw()
 ```
 
 ```{r}
-ggplot(
-  data = sim_results |>
-    tidyr::pivot_longer(
-      cols = c("est_naive", "est_raking"),
-      names_to = "method",
-      names_prefix = "est_",
-      values_to = "estimate"
-    )) +
+ggplot(data = sim_results) +
   geom_violin(mapping = aes(x = clade, y = estimate, color = method)) +
   geom_point(
     data = as.data.frame(clade_props) |>
       dplyr::mutate(clade = c("A", "B", "C")),
     mapping = aes(x = clade, y = clade_props),
-    size = 10,
+    size = 15,
     shape = "—"
   ) +
   theme_bw()
 ```
 
-Here we'll look at mean squared errors of the estimates from each method for each clade:
+Here we'll look at mean absolute errors and mean squared errors of the estimates from each method for each clade:
 ```{r}
 sim_results |>
-  tidyr::pivot_longer(
-    cols = c("est_naive", "est_raking"),
-    names_to = "method",
-    names_prefix = "est_",
-    values_to = "estimate"
-  ) |>
   dplyr::left_join(
     as.data.frame(clade_props) |>
       dplyr::mutate(clade = c("A", "B", "C")),
@@ -394,24 +543,180 @@ sim_results |>
     theme_bw()
 ```
 
-Take-aways:
+Here are the coverage rates of the two methods that produced confidence intervals:
+```{r}
+sim_results |>
+  dplyr::filter(method %in% c("naive", "rake")) |>
+  dplyr::left_join(
+    as.data.frame(clade_props) |>
+      dplyr::mutate(clade = c("A", "B", "C")),
+    by = "clade"
+  ) |>
+  dplyr::mutate(
+    cover = (clade_props >= ci_lower) & (clade_props <= ci_upper),
+    interval_width = (ci_upper - ci_lower)
+  ) |>
+  dplyr::group_by(method, clade) |>
+  dplyr::summarize(
+    cover_rate = mean(cover),
+    mean_interval_width = mean(interval_width)
+  )
+```
 
-- The average or median estimate is better when using raking
-- But the average difference between the estimate and the actual proportions is smaller when using the naive approach! (same for the average squared difference)
+
+## Simulation 2: overrepresented county different from overall population
+
+Now we modify the clade proportions for Worcester county to be different from the other counties:
+
+```{r}
+clade_props_by_county[pops$location == "Worcester", ] <- c(0.4, 0.2, 0.4)
+cbind(pops['location'], clade_props_by_county)
+
+pops$inf_count <- pops$pop * 5 / 100000 * 20
+clade_inf_by_county <- round(clade_props_by_county * pops$inf_count)
+print(cbind(pops["location"], clade_inf_by_county))
+
+# the "realized" clade proportions in each county:
+print(cbind(pops["location"],
+            sweep(clade_inf_by_county,
+                  1,
+                  apply(clade_inf_by_county, 1, sum),
+                  "/")))
+```
+
+Our goal is to obtain estimates of the proportion of all infections that are from each clade, state-wide:
+```{r}
+# population proportions to estimate
+clade_counts <- apply(clade_inf_by_county, 2, sum)
+clade_props <- clade_counts / sum(clade_counts)
+print(clade_props)
+```
+
+```{r, results = 'hide'}
+n_replicates <- 1000
+set.seed(42)
+sim_results_2 <- purrr::map(seq_len(n_replicates), do_one_replicate, clade_inf_by_county=clade_inf_by_county) |>
+  purrr::list_rbind()
+```
+
+```{r}
+sim_results_2$method <- factor(
+  sim_results_2$method,
+  levels = c("naive", "anesrake_cap2", "anesrake_cap5", "rake")
+)
+```
+
+Plotting (the sampling distribution of) the resulting estimates
+```{r}
+ggplot(data = sim_results_2) +
+  geom_boxplot(mapping = aes(x = clade, y = estimate, color = method)) +
+  geom_point(
+    data = as.data.frame(clade_props) |>
+      dplyr::mutate(clade = c("A", "B", "C")),
+    mapping = aes(x = clade, y = clade_props),
+    size = 15,
+    shape = "—"
+  ) +
+  theme_bw()
+```
+
+```{r}
+ggplot(data = sim_results_2) +
+  geom_violin(mapping = aes(x = clade, y = estimate, color = method)) +
+  geom_point(
+    data = as.data.frame(clade_props) |>
+      dplyr::mutate(clade = c("A", "B", "C")),
+    mapping = aes(x = clade, y = clade_props),
+    size = 15,
+    shape = "—"
+  ) +
+  theme_bw()
+```
+
+Here we'll look at mean absolute errors and mean squared errors of the estimates from each method for each clade:
+```{r}
+sim_results_2 |>
+  dplyr::left_join(
+    as.data.frame(clade_props) |>
+      dplyr::mutate(clade = c("A", "B", "C")),
+    by = "clade"
+  ) |>
+  dplyr::mutate(
+    error = estimate - clade_props,
+    sq_error = error^2,
+    abs_error = abs(error)
+  ) |>
+  dplyr::group_by(method, clade) |>
+  dplyr::summarize(
+    MSE = mean(sq_error),
+    MAE = mean(abs_error)
+  ) |>
+  tidyr::pivot_longer(
+    cols = c("MSE", "MAE"),
+    names_to = "metric_name",
+    values_to = "metric_value") |>
+  ggplot() +
+    geom_point(
+      mapping = aes(x = clade, y = metric_value, color = method)
+    ) +
+    facet_wrap( ~ metric_name, ncol = 1, scales = "free_y") +
+    theme_bw()
+```
+
+Here are the coverage rates of the two methods that produced confidence intervals:
+```{r}
+sim_results_2 |>
+  dplyr::filter(method %in% c("naive", "rake")) |>
+  dplyr::left_join(
+    as.data.frame(clade_props) |>
+      dplyr::mutate(clade = c("A", "B", "C")),
+    by = "clade"
+  ) |>
+  dplyr::mutate(
+    cover = (clade_props >= ci_lower) & (clade_props <= ci_upper),
+    interval_width = (ci_upper - ci_lower)
+  ) |>
+  dplyr::group_by(method, clade) |>
+  dplyr::summarize(
+    cover_rate = mean(cover),
+    mean_interval_width = mean(interval_width)
+  )
+```
+
+
+## Wrapping up
+
+Take-aways about *point estimates*:
+
+- In both simulation settings, the average or median estimate is better when using raking. In this simulation, raking is successful at correcting for the bias in the sampling.
+- But raking increases the variability in estimates from different samples.
+- Whether or not raking improved the average difference (or squared difference) between the estimate and the actual proportions depended on the simulation setting:
+    - If Worcester county had roughly similar clade proportions as the state overall, the naive estimator had a better MAE and MSE
+    - If Worcester county had very different clade proportions than the state overall, the raking estimator had a better MAE and MSE
 - This is an example of a "bias-variance tradeoff": we can get reduced bias, but in order to do that we introduce more variability in estimates. We have to decide if the tradeoff is worth it.
+- These results are likely sensitive to other things like the sample size.
 
-Notes:
+Take-aways about *interval estimates*:
 
-- Likely these results are sensitive to the details here: maybe raking would be a better approach more consistently across samples if Worcester's proportions were farther from the statewide proportions.  It may also depend on the sample size.  But this indicates some caution is required before jumping aboard the raking bandwagon: do we expect to see gains in practice?
-- Above, there were ~27 warnings (out of 1000 replicates) for samples where raking didn't converge.  This means it was not able to find sample weights so that the weighted sample proportions aligned with the target proportions of infections in each county.  Perhaps if we used a hybrid strategy that used the naive estimate in those instances, we'd do better?
-- There are a number of tuning parameters for the raking procedure that could help, e.g. maximum values on the weights (set to 5 here).
+- As far as I can tell, there are not methods with statistical guarantees for getting interval estimates based on data gathered with this kind of non-designed sampling mechanism
+- In the simulation setting where Worcester county had similar clade proportions to the state overall, the naive method had pretty good coverage rates
+- In the setting where Worcester county had very different clade proportions than the state overall, the naive coverage rates were terrible; raking-based coverage rates were not great, but were better.
 
-# Open questions
 
- - Are there important ways to adjust this setup to be more realistic?
- - Handling more than 1 demographic covariate (e.g. race/ethnicity in addition to location)
- - Getting estimates of uncertainty
- - Getting estimates based on samples collected across multiple weeks
+Misc. notes and open questions
+
+ - If we want to choose between raking and naive methods, it seems like it will be important to know:
+    - how much variation do we expect there to be among clade proportions in different locations?
+    - what kinds of sample sizes will we typically be working with?
+        - raking would benefit from larger sample sizes -- i think, especially in the locations with few samples
+        - could we get any kind of minimum number of samples from each county?
+ - Similarly, we might be able to improve the stability of the raking estimators by grouping the counties with fewer sequences into larger units (with the potential downside of losing information if we group together locations with different variant prevalences).
+ - Are there other important ways to update the design of this simulation study to be more realistic?
+ - Handling more than 1 covariate (e.g. race/ethnicity in addition to location)
+    - this is technically possible
+    - but it would make the problems with increased variability of the raked estimates even worse
+ - What are plausible ways to get estimates based on samples collected across multiple weeks?
+    - There are many options; my instinct would be to try to use raking in each week and then smooth with a model?
  - What are impacts of bias in which cases are selected for sequencing
     - by clade, e.g. maybe clade A is more prevalent but less severe, so fewer people get tested/sequenced
     - by other factors that may be associated with clade but are not controlled for in the analysis?
